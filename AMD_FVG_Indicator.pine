@@ -1,0 +1,991 @@
+//@version=5
+indicator(
+    title = "AMD — Accumulation · Manipulation · Distribution | RehanFX_Alpha",
+    shorttitle = "AMD·FVG",
+    overlay = true,
+    max_boxes_count = 500,
+    max_lines_count = 500,
+    max_labels_count = 500
+)
+
+// ════════════════════════════════════════════
+// SECTION 1 — USER INPUTS
+// ════════════════════════════════════════════
+
+group_amd = "━━━ AMD SETTINGS ━━━"
+
+// Accumulation Settings
+acc_lookback = input.int(
+    20, "Accumulation Lookback (bars)", 
+    minval=10, maxval=50, 
+    group=group_amd,
+    tooltip="Number of bars to detect consolidation/range"
+)
+acc_threshold = input.float(
+    0.5, "Accumulation Range Threshold (%)", 
+    minval=0.1, maxval=2.0, step=0.1,
+    group=group_amd,
+    tooltip="Max price range % to qualify as accumulation"
+)
+
+// Manipulation Settings
+group_manip = "━━━ MANIPULATION SETTINGS ━━━"
+manip_wick_mult = input.float(
+    1.5, "Wick Multiplier for Stop Hunt", 
+    minval=1.0, maxval=3.0, step=0.1,
+    group=group_manip,
+    tooltip="How aggressively price wicks beyond range"
+)
+manip_lookback = input.int(
+    5, "Manipulation Detection Window (bars)",
+    minval=2, maxval=10,
+    group=group_manip,
+    tooltip="Max bars allowed after accumulation ends to detect manipulation"
+)
+
+// FVG Settings
+group_fvg = "━━━ FVG SETTINGS ━━━"
+fvg_min_size = input.float(
+    0.1, "Minimum FVG Size (%)",
+    minval=0.05, maxval=1.0, step=0.05,
+    group=group_fvg,
+    tooltip="Minimum gap size to qualify as valid FVG"
+)
+fvg_max_age = input.int(
+    10, "FVG Max Age (bars)",
+    minval=3, maxval=30,
+    group=group_fvg,
+    tooltip="How many bars FVG remains valid for entry"
+)
+show_fvg_box = input.bool(
+    true, "Show FVG Boxes on Chart",
+    group=group_fvg
+)
+
+// Distribution Settings
+group_dist = "━━━ DISTRIBUTION SETTINGS ━━━"
+dist_fib_1 = input.float(
+    1.0, "Target 1 — Fibonacci Level",
+    minval=0.5, maxval=1.0, step=0.1,
+    group=group_dist,
+    tooltip="First target as Fibonacci extension of manipulation"
+)
+dist_fib_2 = input.float(
+    1.5, "Target 2 — Fibonacci Level",
+    minval=1.0, maxval=2.0, step=0.1,
+    group=group_dist
+)
+dist_fib_3 = input.float(
+    2.0, "Target 3 — Fibonacci Level",
+    minval=1.5, maxval=3.0, step=0.1,
+    group=group_dist
+)
+
+// Signal Settings
+group_signal = "━━━ SIGNAL SETTINGS ━━━"
+show_signals = input.bool(
+    true, "Show Entry Signals",
+    group=group_signal
+)
+show_sl_line = input.bool(
+    true, "Show Stop Loss Line",
+    group=group_signal
+)
+show_targets = input.bool(
+    true, "Show Target Levels",
+    group=group_signal
+)
+signal_on_fvg_touch = input.bool(
+    true, "Signal on FVG Touch (vs FVG Formation)",
+    group=group_signal,
+    tooltip="True = wait for price to enter FVG zone. False = signal immediately on FVG formation"
+)
+atr_sl_mult = input.float(
+    0.5, "Stop Loss ATR Multiplier",
+    minval=0.1, maxval=2.0, step=0.1,
+    group=group_signal,
+    tooltip="Stop loss placed X * ATR beyond manipulation wick"
+)
+
+// Visual Settings
+group_visual = "━━━ VISUAL SETTINGS ━━━"
+col_accumulation = input.color(
+    color.new(#4fc3f7, 80), "Accumulation Zone Color",
+    group=group_visual
+)
+col_manipulation_bull = input.color(
+    color.new(#ff3366, 75), "Manipulation Zone Color (Bullish)",
+    group=group_visual
+)
+col_manipulation_bear = input.color(
+    color.new(#ff3366, 75), "Manipulation Zone Color (Bearish)",
+    group=group_visual
+)
+col_fvg_bull = input.color(
+    color.new(#00ff88, 70), "Bullish FVG Color",
+    group=group_visual
+)
+col_fvg_bear = input.color(
+    color.new(#ff3366, 70), "Bearish FVG Color",
+    group=group_visual
+)
+col_target = input.color(
+    color.new(#FFD700, 0), "Target Level Color",
+    group=group_visual
+)
+
+// Alert Settings
+group_alerts = "━━━ ALERT SETTINGS ━━━"
+alert_on_signal = input.bool(
+    true, "Enable Trade Alerts",
+    group=group_alerts
+)
+
+// ════════════════════════════════════════════
+// SECTION 2 — CORE CALCULATIONS
+// ════════════════════════════════════════════
+
+// ── ATR for dynamic measurements ──────────
+atr_val = ta.atr(14)
+
+// ── PHASE 1: ACCUMULATION DETECTION ───────
+acc_high = ta.highest(high, acc_lookback)
+acc_low  = ta.lowest(low,  acc_lookback)
+acc_range_pct = (acc_high - acc_low) / acc_low * 100
+
+// Accumulation confirmed when range is tight
+in_accumulation = acc_range_pct <= acc_threshold
+
+// Track when accumulation starts (first bar of range)
+acc_started = in_accumulation and not in_accumulation[1]
+
+// Accumulation zone boundaries
+var float acc_zone_high = na
+var float acc_zone_low  = na
+var int   acc_zone_start = na
+
+// Downstream states
+var bool  manip_bull_detected = false
+var bool  manip_bear_detected = false
+var float manip_high          = na
+var float manip_low           = na
+var float manip_close         = na
+var int   manip_bar           = na
+
+var float active_bull_fvg_top    = na
+var float active_bull_fvg_bottom = na
+var int   active_bull_fvg_bar    = na
+var bool  bull_fvg_active        = false
+var box   active_bull_fvg_box    = na
+
+var float active_bear_fvg_top    = na
+var float active_bear_fvg_bottom = na
+var int   active_bear_fvg_bar    = na
+var bool  bear_fvg_active        = false
+var box   active_bear_fvg_box    = na
+
+var float dist_bull_base  = na
+var float dist_bull_t1    = na
+var float dist_bull_t2    = na
+var float dist_bull_t3    = na
+
+var float dist_bear_base  = na
+var float dist_bear_t1    = na
+var float dist_bear_t2    = na
+var float dist_bear_t3    = na
+
+// Reset all states when a new accumulation phase starts
+if acc_started
+    acc_zone_high       := acc_high
+    acc_zone_low        := acc_low
+    acc_zone_start      := bar_index
+    manip_bull_detected := false
+    manip_bear_detected := false
+    manip_low           := na
+    manip_high          := na
+    manip_close         := na
+    manip_bar           := na
+    bull_fvg_active     := false
+    bear_fvg_active     := false
+    active_bull_fvg_top    := na
+    active_bull_fvg_bottom := na
+    active_bull_fvg_bar    := na
+    active_bear_fvg_top    := na
+    active_bear_fvg_bottom := na
+    active_bear_fvg_bar    := na
+    dist_bull_base      := na
+    dist_bull_t1        := na
+    dist_bull_t2        := na
+    dist_bull_t3        := na
+    dist_bear_base      := na
+    dist_bear_t1        := na
+    dist_bear_t2        := na
+    dist_bear_t3        := na
+
+// ── PHASE 2: MANIPULATION DETECTION ───────
+// Restrict manipulation window based on manip_lookback input
+bars_since_accumulation = ta.barssince(in_accumulation)
+within_manip_window = not na(bars_since_accumulation) and bars_since_accumulation <= manip_lookback
+
+bull_manip_wick = acc_zone_low - low
+bull_manip_condition = (
+    within_manip_window and
+    not na(acc_zone_low) and
+    low < acc_zone_low and
+    close > acc_zone_low and
+    bull_manip_wick >= atr_val * manip_wick_mult * 0.3
+)
+
+bear_manip_wick = high - acc_zone_high
+bear_manip_condition = (
+    within_manip_window and
+    not na(acc_zone_high) and
+    high > acc_zone_high and
+    close < acc_zone_high and
+    bear_manip_wick >= atr_val * manip_wick_mult * 0.3
+)
+
+if bull_manip_condition
+    manip_bull_detected := true
+    manip_bear_detected := false
+    manip_low           := low
+    manip_high          := high
+    manip_close         := close
+    manip_bar           := bar_index
+
+if bear_manip_condition
+    manip_bear_detected := true
+    manip_bull_detected := false
+    manip_low           := low
+    manip_high          := high
+    manip_close         := close
+    manip_bar           := bar_index
+
+// Reset manipulation after too many bars pass
+manip_age = bar_index - manip_bar
+if manip_age > 20
+    manip_bull_detected := false
+    manip_bear_detected := false
+
+// ── PHASE 3: FVG DETECTION ─────────────────
+// Bullish FVG
+bull_fvg_top    = low[0]
+bull_fvg_bottom = high[2]
+bull_fvg_size   = (bull_fvg_top - bull_fvg_bottom) / close * 100
+bull_fvg_valid  = (
+    high[2] < low[0] and
+    bull_fvg_size >= fvg_min_size and
+    close[1] > open[1] and   // impulse candle must be bullish
+    manip_bull_detected and  // only valid after bull manipulation
+    manip_age <= fvg_max_age
+)
+
+// Bearish FVG
+bear_fvg_top    = low[2]
+bear_fvg_bottom = high[0]
+bear_fvg_size   = (bear_fvg_top - bear_fvg_bottom) / close * 100
+bear_fvg_valid  = (
+    low[2] > high[0] and
+    bear_fvg_size >= fvg_min_size and
+    close[1] < open[1] and   // impulse candle must be bearish
+    manip_bear_detected and  // only valid after bear manipulation
+    manip_age <= fvg_max_age
+)
+
+// FVG Box Management & Activation
+if bull_fvg_valid
+    active_bull_fvg_top    := bull_fvg_top
+    active_bull_fvg_bottom := bull_fvg_bottom
+    active_bull_fvg_bar    := bar_index
+    bull_fvg_active        := true
+    
+    if show_fvg_box
+        active_bull_fvg_box := box.new(
+            left         = bar_index - 2,
+            top          = active_bull_fvg_top,
+            right        = bar_index,
+            bottom       = active_bull_fvg_bottom,
+            bgcolor      = col_fvg_bull,
+            border_color = color.new(#00ff88, 40),
+            border_width = 1,
+            border_style = line.style_dashed
+        )
+        label.new(
+            x         = bar_index - 1,
+            y         = (active_bull_fvg_top + active_bull_fvg_bottom) / 2,
+            text      = "FVG",
+            style     = label.style_label_center,
+            color     = color.new(#00ff88, 100),
+            textcolor = #00ff88,
+            size      = size.tiny,
+            tooltip   = "BULLISH FVG\nTop: " + 
+                        str.tostring(math.round(active_bull_fvg_top, 2)) +
+                        "\nBottom: " + 
+                        str.tostring(math.round(active_bull_fvg_bottom, 2)) +
+                        "\nSize: " + 
+                        str.tostring(math.round(bull_fvg_size, 3)) + "%"
+        )
+
+if bear_fvg_valid
+    active_bear_fvg_top    := bear_fvg_top
+    active_bear_fvg_bottom := bear_fvg_bottom
+    active_bear_fvg_bar    := bar_index
+    bear_fvg_active        := true
+    
+    if show_fvg_box
+        active_bear_fvg_box := box.new(
+            left         = bar_index - 2,
+            top          = active_bear_fvg_top,
+            right        = bar_index,
+            bottom       = active_bear_fvg_bottom,
+            bgcolor      = col_fvg_bear,
+            border_color = color.new(#ff3366, 40),
+            border_width = 1,
+            border_style = line.style_dashed
+        )
+        label.new(
+            x         = bar_index - 1,
+            y         = (active_bear_fvg_top + active_bear_fvg_bottom) / 2,
+            text      = "FVG",
+            style     = label.style_label_center,
+            color     = color.new(#ff3366, 100),
+            textcolor = #ff3366,
+            size      = size.tiny,
+            tooltip   = "BEARISH FVG\nTop: " + 
+                        str.tostring(math.round(active_bear_fvg_top, 2)) +
+                        "\nBottom: " + 
+                        str.tostring(math.round(active_bear_fvg_bottom, 2)) +
+                        "\nSize: " + 
+                        str.tostring(math.round(bear_fvg_size, 3)) + "%"
+        )
+
+// FVG filled check
+bull_fvg_filled = bull_fvg_active and low <= active_bull_fvg_bottom
+bear_fvg_filled = bear_fvg_active and high >= active_bear_fvg_top
+
+// Age counters
+bull_fvg_age = bar_index - active_bull_fvg_bar
+bear_fvg_age = bar_index - active_bear_fvg_bar
+
+// Dynamic box resizing and deactivation
+if bull_fvg_active and not na(active_bull_fvg_box)
+    box.set_right(active_bull_fvg_box, bar_index)
+
+if bull_fvg_filled
+    bull_fvg_active := false
+    if not na(active_bull_fvg_box)
+        box.set_right(active_bull_fvg_box, bar_index)
+        box.set_bgcolor(active_bull_fvg_box, color.new(col_fvg_bull, 98))
+        box.set_border_color(active_bull_fvg_box, color.new(#00ff88, 90))
+        box.set_border_style(active_bull_fvg_box, line.style_dotted)
+
+if bull_fvg_active and bull_fvg_age > fvg_max_age
+    bull_fvg_active := false
+    if not na(active_bull_fvg_box)
+        box.set_right(active_bull_fvg_box, active_bull_fvg_bar + fvg_max_age)
+        box.set_bgcolor(active_bull_fvg_box, color.new(col_fvg_bull, 98))
+        box.set_border_color(active_bull_fvg_box, color.new(#00ff88, 90))
+        box.set_border_style(active_bull_fvg_box, line.style_dotted)
+
+if bear_fvg_active and not na(active_bear_fvg_box)
+    box.set_right(active_bear_fvg_box, bar_index)
+
+if bear_fvg_filled
+    bear_fvg_active := false
+    if not na(active_bear_fvg_box)
+        box.set_right(active_bear_fvg_box, bar_index)
+        box.set_bgcolor(active_bear_fvg_box, color.new(col_fvg_bear, 98))
+        box.set_border_color(active_bear_fvg_box, color.new(#ff3366, 90))
+        box.set_border_style(active_bear_fvg_box, line.style_dotted)
+
+if bear_fvg_active and bear_fvg_age > fvg_max_age
+    bear_fvg_active := false
+    if not na(active_bear_fvg_box)
+        box.set_right(active_bear_fvg_box, active_bear_fvg_bar + fvg_max_age)
+        box.set_bgcolor(active_bear_fvg_box, color.new(col_fvg_bear, 98))
+        box.set_border_color(active_bear_fvg_box, color.new(#ff3366, 90))
+        box.set_border_style(active_bear_fvg_box, line.style_dotted)
+
+// Price touching FVG zone (restricted to subsequent bars to prevent formation-bar instant triggers)
+price_in_bull_fvg = (
+    bull_fvg_active and
+    bar_index > active_bull_fvg_bar and
+    low < active_bull_fvg_top and
+    high >= active_bull_fvg_bottom
+)
+
+price_in_bear_fvg = (
+    bear_fvg_active and
+    bar_index > active_bear_fvg_bar and
+    high > active_bear_fvg_bottom and
+    low <= active_bear_fvg_top
+)
+
+// ── PHASE 4: DISTRIBUTION ESTIMATE ────────
+if bull_fvg_valid and not na(manip_low) and not na(acc_zone_high)
+    manip_range       = acc_zone_high - manip_low
+    dist_bull_base   := acc_zone_high
+    dist_bull_t1     := acc_zone_high + (manip_range * dist_fib_1)
+    dist_bull_t2     := acc_zone_high + (manip_range * dist_fib_2)
+    dist_bull_t3     := acc_zone_high + (manip_range * dist_fib_3)
+
+if bear_fvg_valid and not na(manip_high) and not na(acc_zone_low)
+    manip_range       = manip_high - acc_zone_low
+    dist_bear_base   := acc_zone_low
+    dist_bear_t1     := acc_zone_low - (manip_range * dist_fib_1)
+    dist_bear_t2     := acc_zone_low - (manip_range * dist_fib_2)
+    dist_bear_t3     := acc_zone_low - (manip_range * dist_fib_3)
+
+// ── SIGNAL GENERATION ─────────────────────
+bull_signal = (
+    show_signals and
+    manip_bull_detected and
+    bull_fvg_active and
+    (signal_on_fvg_touch ? price_in_bull_fvg : bull_fvg_valid)
+)
+
+bear_signal = (
+    show_signals and
+    manip_bear_detected and
+    bear_fvg_active and
+    (signal_on_fvg_touch ? price_in_bear_fvg : bear_fvg_valid)
+)
+
+// Stop Loss levels
+bull_sl = manip_low - (atr_val * atr_sl_mult)
+bear_sl = manip_high + (atr_val * atr_sl_mult)
+
+// Risk:Reward calculation
+bull_rr_t1 = not na(dist_bull_t1) and not na(bull_sl) ? 
+    math.round((dist_bull_t1 - close) / (close - bull_sl), 1) : na
+bear_rr_t1 = not na(dist_bear_t1) and not na(bear_sl) ? 
+    math.round((close - dist_bear_t1) / (bear_sl - close), 1) : na
+
+// Deactivate FVG and reset manipulation detection once signal triggers
+if bull_signal
+    bull_fvg_active := false
+    manip_bull_detected := false
+
+if bear_signal
+    bear_fvg_active := false
+    manip_bear_detected := false
+
+// ════════════════════════════════════════════
+// SECTION 3 — VISUAL RENDERING
+// ════════════════════════════════════════════
+
+// ── ACCUMULATION ZONE BOX ─────────────────
+var box acc_box = na
+
+if acc_started and not na(acc_zone_high) and not na(acc_zone_low)
+    acc_box := box.new(
+        left        = bar_index - acc_lookback,
+        top         = acc_zone_high,
+        right       = bar_index,
+        bottom      = acc_zone_low,
+        bgcolor     = col_accumulation,
+        border_color= color.new(#4fc3f7, 40),
+        border_width = 1
+    )
+    label.new(
+        x           = bar_index - acc_lookback,
+        y           = acc_zone_high,
+        text        = "A",
+        style       = label.style_label_right,
+        color       = color.new(#4fc3f7, 60),
+        textcolor   = #4fc3f7,
+        size        = size.small,
+        tooltip     = "ACCUMULATION PHASE\nRange: " + 
+                      str.tostring(math.round(acc_range_pct, 2)) + "%"
+    )
+else if in_accumulation and not na(acc_box)
+    box.set_right(acc_box, bar_index)
+
+// ── MANIPULATION ZONE ─────────────────────
+if bull_manip_condition
+    box.new(
+        left         = bar_index,
+        top          = acc_zone_high,
+        right        = bar_index + 1,
+        bottom       = low,
+        bgcolor      = col_manipulation_bull,
+        border_color = color.new(#ff3366, 30),
+        border_width = 1
+    )
+    label.new(
+        x         = bar_index,
+        y         = low,
+        text      = "M",
+        style     = label.style_label_up,
+        color     = color.new(#ff3366, 50),
+        textcolor = #ff3366,
+        size      = size.small,
+        tooltip   = "MANIPULATION — BULLISH\nStop Hunt Low\nWick: " +
+                    str.tostring(math.round(bull_manip_wick / close * 100, 2)) + "%"
+    )
+
+if bear_manip_condition
+    box.new(
+        left         = bar_index,
+        top          = high,
+        right        = bar_index + 1,
+        bottom       = acc_zone_low,
+        bgcolor      = col_manipulation_bear,
+        border_color = color.new(#ff3366, 30),
+        border_width = 1
+    )
+    label.new(
+        x         = bar_index,
+        y         = high,
+        text      = "M",
+        style     = label.style_label_down,
+        color     = color.new(#ff3366, 50),
+        textcolor = #ff3366,
+        size      = size.small,
+        tooltip   = "MANIPULATION — BEARISH\nStop Hunt High\nWick: " +
+                    str.tostring(math.round(bear_manip_wick / close * 100, 2)) + "%"
+    )
+
+// ── ENTRY SIGNALS ─────────────────────────
+if bull_signal
+    label.new(
+        x         = bar_index,
+        y         = low - atr_val * 0.5,
+        text      = "▲ LONG\nFVG Entry\nRR: 1:" + 
+                    str.tostring(bull_rr_t1),
+        style     = label.style_label_up,
+        color     = #00ff88,
+        textcolor = #000000,
+        size      = size.normal
+    )
+
+if bear_signal
+    label.new(
+        x         = bar_index,
+        y         = high + atr_val * 0.5,
+        text      = "▼ SHORT\nFVG Entry\nRR: 1:" + 
+                    str.tostring(bear_rr_t1),
+        style     = label.style_label_down,
+        color     = #ff3366,
+        textcolor = #ffffff,
+        size      = size.normal
+    )
+
+// ── STOP LOSS LINE ────────────────────────
+if bull_signal and show_sl_line
+    line.new(
+        x1    = bar_index,
+        y1    = bull_sl,
+        x2    = bar_index + 10,
+        y2    = bull_sl,
+        color = color.new(#ff3366, 30),
+        style = line.style_dashed,
+        width = 1
+    )
+    label.new(
+        x         = bar_index + 10,
+        y         = bull_sl,
+        text      = "SL: " + str.tostring(math.round(bull_sl, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#ff3366, 60),
+        textcolor = #ff3366,
+        size      = size.tiny
+    )
+
+if bear_signal and show_sl_line
+    line.new(
+        x1    = bar_index,
+        y1    = bear_sl,
+        x2    = bar_index + 10,
+        y2    = bear_sl,
+        color = color.new(#ff3366, 30),
+        style = line.style_dashed,
+        width = 1
+    )
+    label.new(
+        x         = bar_index + 10,
+        y         = bear_sl,
+        text      = "SL: " + str.tostring(math.round(bear_sl, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#ff3366, 60),
+        textcolor = #ff3366,
+        size      = size.tiny
+    )
+
+// ── DISTRIBUTION TARGETS ──────────────────
+if bull_signal and show_targets and not na(dist_bull_t1)
+    // Target 1
+    line.new(
+        x1    = bar_index,
+        y1    = dist_bull_t1,
+        x2    = bar_index + 15,
+        y2    = dist_bull_t1,
+        color = color.new(#FFD700, 20),
+        style = line.style_dotted,
+        width = 2
+    )
+    label.new(
+        x         = bar_index + 15,
+        y         = dist_bull_t1,
+        text      = "T1 " + str.tostring(dist_fib_1) + "R: " + 
+                    str.tostring(math.round(dist_bull_t1, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#FFD700, 50),
+        textcolor = #FFD700,
+        size      = size.tiny
+    )
+    
+    // Target 2
+    line.new(
+        x1    = bar_index,
+        y1    = dist_bull_t2,
+        x2    = bar_index + 15,
+        y2    = dist_bull_t2,
+        color = color.new(#FFD700, 40),
+        style = line.style_dotted,
+        width = 2
+    )
+    label.new(
+        x         = bar_index + 15,
+        y         = dist_bull_t2,
+        text      = "T2 " + str.tostring(dist_fib_2) + "R: " + 
+                    str.tostring(math.round(dist_bull_t2, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#FFD700, 50),
+        textcolor = #FFD700,
+        size      = size.tiny
+    )
+    
+    // Target 3
+    line.new(
+        x1    = bar_index,
+        y1    = dist_bull_t3,
+        x2    = bar_index + 15,
+        y2    = dist_bull_t3,
+        color = color.new(#FFD700, 60),
+        style = line.style_dotted,
+        width = 2
+    )
+    label.new(
+        x         = bar_index + 15,
+        y         = dist_bull_t3,
+        text      = "T3 " + str.tostring(dist_fib_3) + "R: " + 
+                    str.tostring(math.round(dist_bull_t3, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#FFD700, 50),
+        textcolor = #FFD700,
+        size      = size.tiny
+    )
+
+if bear_signal and show_targets and not na(dist_bear_t1)
+    // Target 1
+    line.new(
+        x1    = bar_index,
+        y1    = dist_bear_t1,
+        x2    = bar_index + 15,
+        y2    = dist_bear_t1,
+        color = color.new(#FFD700, 20),
+        style = line.style_dotted,
+        width = 2
+    )
+    label.new(
+        x         = bar_index + 15,
+        y         = dist_bear_t1,
+        text      = "T1 " + str.tostring(dist_fib_1) + "R: " + 
+                    str.tostring(math.round(dist_bear_t1, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#FFD700, 50),
+        textcolor = #FFD700,
+        size      = size.tiny
+    )
+    
+    // Target 2
+    line.new(
+        x1    = bar_index,
+        y1    = dist_bear_t2,
+        x2    = bar_index + 15,
+        y2    = dist_bear_t2,
+        color = color.new(#FFD700, 40),
+        style = line.style_dotted,
+        width = 2
+    )
+    label.new(
+        x         = bar_index + 15,
+        y         = dist_bear_t2,
+        text      = "T2 " + str.tostring(dist_fib_2) + "R: " + 
+                    str.tostring(math.round(dist_bear_t2, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#FFD700, 50),
+        textcolor = #FFD700,
+        size      = size.tiny
+    )
+    
+    // Target 3
+    line.new(
+        x1    = bar_index,
+        y1    = dist_bear_t3,
+        x2    = bar_index + 15,
+        y2    = dist_bear_t3,
+        color = color.new(#FFD700, 60),
+        style = line.style_dotted,
+        width = 2
+    )
+    label.new(
+        x         = bar_index + 15,
+        y         = dist_bear_t3,
+        text      = "T3 " + str.tostring(dist_fib_3) + "R: " + 
+                    str.tostring(math.round(dist_bear_t3, 2)),
+        style     = label.style_label_left,
+        color     = color.new(#FFD700, 50),
+        textcolor = #FFD700,
+        size      = size.tiny
+    )
+
+// ── PHASE DASHBOARD TABLE ─────────────────
+// Bottom right info table showing current phase status
+
+var table phase_table = table.new(
+    position  = position.bottom_right,
+    columns   = 2,
+    rows      = 6,
+    bgcolor   = color.new(#000000, 20),
+    border_color = color.new(#1e1e1e, 0),
+    border_width = 1,
+    frame_color  = color.new(#C9A84C, 40),
+    frame_width  = 1
+)
+
+// Dynamic timeframe verification
+is_1h = timeframe.period == "60"
+tf_text = is_1h ? "1H TIMEFRAME (OK)" : "TF: " + timeframe.period + " (1H RECOMMENDED)"
+tf_color = is_1h ? #00ff88 : #ff3366
+
+// Header
+table.cell(phase_table, 0, 0, 
+    text       = "AMD·FVG | RehanFX_Alpha",
+    text_color = #C9A84C,
+    text_size  = size.small,
+    bgcolor    = color.new(#0a0a0a, 10),
+    text_halign = text.align_center
+)
+table.cell(phase_table, 1, 0,
+    text       = tf_text,
+    text_color = tf_color,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#0a0a0a, 10),
+    text_halign = text.align_center
+)
+
+// Phase 1 - Accumulation
+table.cell(phase_table, 0, 1,
+    text       = "◈ ACCUMULATION",
+    text_color = #4fc3f7,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+table.cell(phase_table, 1, 1,
+    text       = in_accumulation ? "✓ ACTIVE" : "○ WAITING",
+    text_color = in_accumulation ? #00ff88 : #666666,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+
+// Phase 2 - Manipulation
+table.cell(phase_table, 0, 2,
+    text       = "◈ MANIPULATION",
+    text_color = #ff3366,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+table.cell(phase_table, 1, 2,
+    text       = (manip_bull_detected or manip_bear_detected) ? 
+                 (manip_bull_detected ? "✓ BULLISH" : "✓ BEARISH") : 
+                 "○ WAITING",
+    text_color = manip_bull_detected ? #00ff88 : 
+                 manip_bear_detected ? #ff3366 : #666666,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+
+// Phase 3 - FVG
+table.cell(phase_table, 0, 3,
+    text       = "◈ FVG",
+    text_color = #00ff88,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+table.cell(phase_table, 1, 3,
+    text       = bull_fvg_active ? "✓ BULL FVG" : 
+                 bear_fvg_active ? "✓ BEAR FVG" : 
+                 "○ WAITING",
+    text_color = bull_fvg_active ? #00ff88 : 
+                 bear_fvg_active ? #ff3366 : #666666,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+
+// Phase 4 - Distribution
+table.cell(phase_table, 0, 4,
+    text       = "◈ DISTRIBUTION",
+    text_color = #FFD700,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+table.cell(phase_table, 1, 4,
+    text       = not na(dist_bull_t1) or not na(dist_bear_t1) ? 
+                 "✓ TARGETS SET" : "○ WAITING",
+    text_color = not na(dist_bull_t1) or not na(dist_bear_t1) ? 
+                 #FFD700 : #666666,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+
+// Signal Status
+table.cell(phase_table, 0, 5,
+    text       = "◈ SIGNAL",
+    text_color = #ffffff,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+table.cell(phase_table, 1, 5,
+    text       = bull_signal ? "▲ LONG — ENTER" : 
+                 bear_signal ? "▼ SHORT — ENTER" : 
+                 "○ NO SIGNAL",
+    text_color = bull_signal ? #00ff88 : 
+                 bear_signal ? #ff3366 : #666666,
+    text_size  = size.tiny,
+    bgcolor    = color.new(#000000, 20)
+)
+
+// ════════════════════════════════════════════
+// SECTION 4 — BACKGROUND PHASE COLORING
+// ════════════════════════════════════════════
+
+// Subtle background color for each phase
+bgcolor(
+    in_accumulation ? color.new(#4fc3f7, 97) : na,
+    title = "Accumulation Background"
+)
+bgcolor(
+    bull_manip_condition or bear_manip_condition ? 
+    color.new(#ff3366, 95) : na,
+    title = "Manipulation Background"
+)
+bgcolor(
+    bull_fvg_active or bear_fvg_active ? 
+    color.new(#00ff88, 97) : na,
+    title = "FVG Active Background"
+)
+
+// ════════════════════════════════════════════
+// SECTION 5 — PLOTS
+// ════════════════════════════════════════════
+
+// Accumulation range lines (subtle)
+plot(
+    in_accumulation ? acc_zone_high : na,
+    "Acc High", 
+    color.new(#4fc3f7, 60), 
+    linewidth = 1,
+    style = plot.style_linebr
+)
+plot(
+    in_accumulation ? acc_zone_low : na,
+    "Acc Low",
+    color.new(#4fc3f7, 60),
+    linewidth = 1,
+    style = plot.style_linebr
+)
+
+// Signal shapes on chart
+plotshape(
+    bull_signal,
+    "LONG Signal",
+    shape.triangleup,
+    location.belowbar,
+    #00ff88,
+    size = size.normal
+)
+plotshape(
+    bear_signal,
+    "SHORT Signal",
+    shape.triangledown,
+    location.abovebar,
+    #ff3366,
+    size = size.normal
+)
+
+// FVG touch indicators
+plotshape(
+    price_in_bull_fvg and not bull_signal,
+    "In Bull FVG",
+    shape.circle,
+    location.belowbar,
+    color.new(#00ff88, 40),
+    size = size.tiny
+)
+plotshape(
+    price_in_bear_fvg and not bear_signal,
+    "In Bear FVG",
+    shape.circle,
+    location.abovebar,
+    color.new(#ff3366, 40),
+    size = size.tiny
+)
+
+// ════════════════════════════════════════════
+// SECTION 6 — ALERTS (DECLARED IN GLOBAL SCOPE)
+// ════════════════════════════════════════════
+
+// Bullish signal alert
+alertcondition(
+    bull_signal and alert_on_signal,
+    "AMD·FVG — LONG SIGNAL",
+    "⚡ AMD·FVG LONG SIGNAL\n" +
+    "Symbol: {{ticker}}\n" +
+    "Timeframe: {{interval}}\n" +
+    "Phase: Accumulation → Manipulation → FVG\n" +
+    "Action: ENTER LONG at FVG zone\n" +
+    "Stop Loss: Below manipulation low\n" +
+    "by RehanFX_Alpha"
+)
+
+// Bearish signal alert
+alertcondition(
+    bear_signal and alert_on_signal,
+    "AMD·FVG — SHORT SIGNAL",
+    "⚡ AMD·FVG SHORT SIGNAL\n" +
+    "Symbol: {{ticker}}\n" +
+    "Timeframe: {{interval}}\n" +
+    "Phase: Accumulation → Manipulation → FVG\n" +
+    "Action: ENTER SHORT at FVG zone\n" +
+    "Stop Loss: Above manipulation high\n" +
+    "by RehanFX_Alpha"
+)
+
+// FVG formed alert (early warning)
+alertcondition(
+    (bull_fvg_valid or bear_fvg_valid) and alert_on_signal,
+    "AMD·FVG — FVG DETECTED",
+    "⚡ FVG DETECTED after Manipulation\n" +
+    "Symbol: {{ticker}}\n" +
+    "Watch for price return to FVG zone\n" +
+    "by RehanFX_Alpha"
+)
+
+// Price entering FVG zone alert
+alertcondition(
+    (price_in_bull_fvg or price_in_bear_fvg) and alert_on_signal,
+    "AMD·FVG — PRICE IN FVG ZONE",
+    "⚡ PRICE ENTERING FVG ZONE\n" +
+    "Symbol: {{ticker}}\n" +
+    "High probability entry zone reached\n" +
+    "Confirm with price action\n" +
+    "by RehanFX_Alpha"
+)
+
+// ─── INDICATOR BY REHANFX_ALPHA ───────────
+// github.com/rehanqx
+// trade.monsternetwork.site
+// Founder @ TeamCyberOps 
+// ─────────────────────────────────────────
